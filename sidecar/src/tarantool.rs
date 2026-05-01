@@ -1,12 +1,17 @@
-//! Minimal synchronous Tarantool iproto client.
-//! Only supports CALL — sufficient for talking to our `loom.*` stored procs.
+//! Async Tarantool iproto client backed by tokio.
+//! Supports CALL with sync-id multiplexing on a single connection.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use rmpv::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{Mutex, oneshot};
 
 const IPROTO_CODE: u8 = 0x00;
 const IPROTO_SYNC: u8 = 0x01;
@@ -15,141 +20,87 @@ const IPROTO_ERROR_LEGACY: u8 = 0x31;
 const IPROTO_TUPLE: u8 = 0x21;
 const IPROTO_FUNCTION_NAME: u8 = 0x22;
 const REQUEST_TYPE_CALL: u8 = 0x0a;
+const REQUEST_TYPE_AUTH: u8 = 0x07;
+const IPROTO_USER_NAME: u8 = 0x23;
 const RESPONSE_OK: u64 = 0;
 
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+#[derive(Clone)]
 pub struct Client {
-    stream: TcpStream,
-    next_sync: u64,
+    write: Arc<Mutex<OwnedWriteHalf>>,
+    pending: Pending,
+    next_sync: Arc<AtomicU64>,
 }
 
 impl Client {
-    pub fn connect(addr: &str) -> Result<Self> {
-        Self::connect_auth(addr, None)
+    #[allow(dead_code)]
+    pub async fn connect(addr: &str) -> Result<Self> {
+        Self::connect_auth(addr, None).await
     }
 
-    pub fn connect_auth(addr: &str, auth: Option<(&str, &str)>) -> Result<Self> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    pub async fn connect_auth(addr: &str, auth: Option<(&str, &str)>) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
+        let (mut read_half, mut write_half) = stream.into_split();
 
-        let mut s = Self { stream, next_sync: 0 };
         let mut greeting = [0u8; 128];
-        s.stream.read_exact(&mut greeting)?;
+        read_half.read_exact(&mut greeting).await?;
 
         if let Some((user, pass)) = auth {
-            // greeting bytes 64..107 are base64-encoded salt (44 chars + spaces)
             let salt_b64 = std::str::from_utf8(&greeting[64..108])
                 .map_err(|e| anyhow!("bad greeting: {e}"))?
                 .trim();
-            s.authenticate(user, pass, salt_b64)?;
+            authenticate(&mut write_half, &mut read_half, user, pass, salt_b64).await?;
         }
-        Ok(s)
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_sync = Arc::new(AtomicU64::new(1));
+
+        let pending_for_reader = Arc::clone(&pending);
+        tokio::spawn(async move {
+            if let Err(e) = reader_loop(read_half, pending_for_reader.clone()).await {
+                tracing::warn!(error = %e, "tarantool reader exited");
+                let mut p = pending_for_reader.lock().await;
+                for (_, tx) in p.drain() {
+                    let _ = tx.send(Err(anyhow!("tarantool connection lost: {e}")));
+                }
+            }
+        });
+
+        Ok(Self {
+            write: Arc::new(Mutex::new(write_half)),
+            pending,
+            next_sync,
+        })
     }
 
-    pub fn connect_with_retry_auth(
-        addr: &str, auth: Option<(&str, &str)>, attempts: u32, delay_ms: u64,
+    pub async fn connect_auth_with_retry(
+        addr: &str,
+        auth: Option<(&str, &str)>,
+        attempts: u32,
+        delay_ms: u64,
     ) -> Result<Self> {
-        let mut last = None;
+        let mut last: Option<anyhow::Error> = None;
         for i in 1..=attempts {
-            match Self::connect_auth(addr, auth) {
+            match Self::connect_auth(addr, auth).await {
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     tracing::warn!(attempt = i, error = %e, "tarantool connect failed, retrying");
                     last = Some(e);
-                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("connect failed")))
-    }
-
-    pub fn connect_with_retry(addr: &str, attempts: u32, delay_ms: u64) -> Result<Self> {
-        let mut last = None;
-        for i in 1..=attempts {
-            match Self::connect(addr) {
-                Ok(c) => return Ok(c),
-                Err(e) => {
-                    tracing::warn!(attempt = i, error = %e, "tarantool connect failed, retrying");
-                    last = Some(e);
-                    std::thread::sleep(Duration::from_millis(delay_ms));
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| anyhow!("connect failed")))
-    }
-
-    fn authenticate(&mut self, user: &str, password: &str, salt_b64: &str) -> Result<()> {
-        use sha1::{Sha1, Digest};
-        use base64::{Engine, engine::general_purpose::STANDARD};
-
-        let salt = STANDARD.decode(salt_b64).map_err(|e| anyhow!("bad salt: {e}"))?;
-        let salt = &salt[..20];
-
-        let mut sha = Sha1::new();
-        sha.update(password.as_bytes());
-        let step1: [u8; 20] = sha.finalize_reset().into();
-
-        sha.update(step1);
-        let step2: [u8; 20] = sha.finalize_reset().into();
-
-        sha.update(salt);
-        sha.update(step2);
-        let step3: [u8; 20] = sha.finalize().into();
-
-        let mut scramble = [0u8; 20];
-        for i in 0..20 { scramble[i] = step1[i] ^ step3[i]; }
-
-        self.next_sync = self.next_sync.wrapping_add(1);
-        let sync = self.next_sync;
-
-        const REQUEST_TYPE_AUTH: u8 = 0x07;
-        const IPROTO_USER_NAME: u8 = 0x23;
-
-        let header = Value::Map(vec![
-            (Value::from(IPROTO_CODE), Value::from(REQUEST_TYPE_AUTH)),
-            (Value::from(IPROTO_SYNC), Value::from(sync)),
-        ]);
-        let body = Value::Map(vec![
-            (Value::from(IPROTO_USER_NAME), Value::from(user)),
-            (Value::from(IPROTO_TUPLE), Value::Array(vec![
-                Value::from("chap-sha1"),
-                Value::Binary(scramble.to_vec()),
-            ])),
-        ]);
-
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &header)?;
-        rmpv::encode::write_value(&mut buf, &body)?;
-        let mut prefix = [0u8; 5];
-        prefix[0] = 0xce;
-        prefix[1..].copy_from_slice(&(buf.len() as u32).to_be_bytes());
-        self.stream.write_all(&prefix)?;
-        self.stream.write_all(&buf)?;
-        self.stream.flush()?;
-
-        let mut size_buf = [0u8; 5];
-        self.stream.read_exact(&mut size_buf)?;
-        let resp_len = u32::from_be_bytes(size_buf[1..].try_into().unwrap()) as usize;
-        let mut resp = vec![0u8; resp_len];
-        self.stream.read_exact(&mut resp)?;
-        let mut cur = std::io::Cursor::new(&resp[..]);
-        let h = rmpv::decode::read_value(&mut cur)?;
-        let b = rmpv::decode::read_value(&mut cur)?;
-        let code = map_get_u64(&h, IPROTO_CODE).unwrap_or(0);
-        if code != RESPONSE_OK {
-            let err = map_get(&b, IPROTO_ERROR_LEGACY).map(|v| v.to_string()).unwrap_or_default();
-            bail!("tarantool auth failed: {err}");
-        }
-        Ok(())
     }
 
     /// Call a Tarantool stored function. `args` must be an array Value.
-    /// Returns the IPROTO_DATA part of the response (typically the function's return value
-    /// wrapped in an outer array, since Tarantool returns multiple values as array).
-    pub fn call(&mut self, func: &str, args: Value) -> Result<Value> {
-        self.next_sync = self.next_sync.wrapping_add(1);
-        let sync = self.next_sync;
+    /// Returns the IPROTO_DATA part of the response.
+    pub async fn call(&self, func: &str, args: Value) -> Result<Value> {
+        let sync = self.next_sync.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(sync, tx);
 
         let header = Value::Map(vec![
             (Value::from(IPROTO_CODE), Value::from(REQUEST_TYPE_CALL)),
@@ -164,41 +115,145 @@ impl Client {
         rmpv::encode::write_value(&mut buf, &header)?;
         rmpv::encode::write_value(&mut buf, &body)?;
 
-        // 5-byte length prefix: msgpack uint32 marker (0xce) + 4-byte BE size.
-        let total: u32 = buf.len() as u32;
         let mut prefix = [0u8; 5];
         prefix[0] = 0xce;
-        prefix[1..].copy_from_slice(&total.to_be_bytes());
+        prefix[1..].copy_from_slice(&(buf.len() as u32).to_be_bytes());
 
-        self.stream.write_all(&prefix)?;
-        self.stream.write_all(&buf)?;
-        self.stream.flush()?;
+        {
+            let mut w = self.write.lock().await;
+            if let Err(e) = w.write_all(&prefix).await {
+                self.pending.lock().await.remove(&sync);
+                bail!("tarantool write failed (prefix): {e}");
+            }
+            if let Err(e) = w.write_all(&buf).await {
+                self.pending.lock().await.remove(&sync);
+                bail!("tarantool write failed (body): {e}");
+            }
+            if let Err(e) = w.flush().await {
+                self.pending.lock().await.remove(&sync);
+                bail!("tarantool flush failed: {e}");
+            }
+        }
 
-        // Read response: 5-byte prefix, then header+body of that length.
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => bail!("tarantool reader closed before reply"),
+        }
+    }
+}
+
+async fn reader_loop(mut read: OwnedReadHalf, pending: Pending) -> Result<()> {
+    loop {
         let mut size_buf = [0u8; 5];
-        self.stream.read_exact(&mut size_buf)?;
+        read.read_exact(&mut size_buf).await?;
         if size_buf[0] != 0xce {
             bail!("unexpected response size marker: 0x{:02x}", size_buf[0]);
         }
         let resp_len = u32::from_be_bytes(size_buf[1..].try_into().unwrap()) as usize;
 
         let mut resp = vec![0u8; resp_len];
-        self.stream.read_exact(&mut resp)?;
+        read.read_exact(&mut resp).await?;
 
         let mut cur = std::io::Cursor::new(&resp[..]);
         let resp_header = rmpv::decode::read_value(&mut cur)?;
         let resp_body = rmpv::decode::read_value(&mut cur)?;
 
         let code = map_get_u64(&resp_header, IPROTO_CODE).unwrap_or(0);
-        if code != RESPONSE_OK {
+        let sync = map_get_u64(&resp_header, IPROTO_SYNC).unwrap_or(0);
+
+        let tx = match pending.lock().await.remove(&sync) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let result = if code == RESPONSE_OK {
+            let data = map_get(&resp_body, IPROTO_DATA)
+                .cloned()
+                .unwrap_or(Value::Nil);
+            Ok(data)
+        } else {
             let err = map_get(&resp_body, IPROTO_ERROR_LEGACY)
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| format!("code {}", code));
-            bail!("tarantool error: {}", err);
-        }
-
-        Ok(map_get(&resp_body, IPROTO_DATA).cloned().unwrap_or(Value::Nil))
+                .unwrap_or_else(|| format!("code {code}"));
+            Err(anyhow!("tarantool error: {err}"))
+        };
+        let _ = tx.send(result);
     }
+}
+
+async fn authenticate(
+    write: &mut OwnedWriteHalf,
+    read: &mut OwnedReadHalf,
+    user: &str,
+    password: &str,
+    salt_b64: &str,
+) -> Result<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha1::{Digest, Sha1};
+
+    let salt = STANDARD
+        .decode(salt_b64)
+        .map_err(|e| anyhow!("bad salt: {e}"))?;
+    let salt = &salt[..20];
+
+    let mut sha = Sha1::new();
+    sha.update(password.as_bytes());
+    let step1: [u8; 20] = sha.finalize_reset().into();
+
+    sha.update(step1);
+    let step2: [u8; 20] = sha.finalize_reset().into();
+
+    sha.update(salt);
+    sha.update(step2);
+    let step3: [u8; 20] = sha.finalize().into();
+
+    let mut scramble = [0u8; 20];
+    for i in 0..20 {
+        scramble[i] = step1[i] ^ step3[i];
+    }
+
+    let header = Value::Map(vec![
+        (Value::from(IPROTO_CODE), Value::from(REQUEST_TYPE_AUTH)),
+        (Value::from(IPROTO_SYNC), Value::from(0u64)),
+    ]);
+    let body = Value::Map(vec![
+        (Value::from(IPROTO_USER_NAME), Value::from(user)),
+        (
+            Value::from(IPROTO_TUPLE),
+            Value::Array(vec![
+                Value::from("chap-sha1"),
+                Value::Binary(scramble.to_vec()),
+            ]),
+        ),
+    ]);
+
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &header)?;
+    rmpv::encode::write_value(&mut buf, &body)?;
+
+    let mut prefix = [0u8; 5];
+    prefix[0] = 0xce;
+    prefix[1..].copy_from_slice(&(buf.len() as u32).to_be_bytes());
+    write.write_all(&prefix).await?;
+    write.write_all(&buf).await?;
+    write.flush().await?;
+
+    let mut size_buf = [0u8; 5];
+    read.read_exact(&mut size_buf).await?;
+    let resp_len = u32::from_be_bytes(size_buf[1..].try_into().unwrap()) as usize;
+    let mut resp = vec![0u8; resp_len];
+    read.read_exact(&mut resp).await?;
+    let mut cur = std::io::Cursor::new(&resp[..]);
+    let h = rmpv::decode::read_value(&mut cur)?;
+    let b = rmpv::decode::read_value(&mut cur)?;
+    let code = map_get_u64(&h, IPROTO_CODE).unwrap_or(0);
+    if code != RESPONSE_OK {
+        let err = map_get(&b, IPROTO_ERROR_LEGACY)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        bail!("tarantool auth failed: {err}");
+    }
+    Ok(())
 }
 
 fn map_get<'a>(map: &'a Value, key: u8) -> Option<&'a Value> {
@@ -220,72 +275,8 @@ fn map_get_u64(map: &Value, key: u8) -> Option<u64> {
 
 // ---------- Loom-specific wrappers ----------
 
-pub struct LoomApi<'a> {
-    pub client: &'a mut Client,
-}
-
-impl<'a> LoomApi<'a> {
-    pub fn list_plugins(&mut self) -> Result<Vec<String>> {
-        let r = self.client.call("loom.file_list_plugins", Value::Array(vec![]))?;
-        let arr = unwrap_call_result(r);
-        Ok(arr.into_iter().filter_map(|v| v.as_str().map(String::from)).collect())
-    }
-
-    pub fn list_files(&mut self, plugin: &str) -> Result<Vec<FileMeta>> {
-        let r = self.client.call(
-            "loom.file_list",
-            Value::Array(vec![Value::from(plugin)]),
-        )?;
-        let arr = unwrap_call_result(r);
-        let mut out = Vec::new();
-        for tuple in arr {
-            if let Some(meta) = parse_file_tuple(&tuple) {
-                out.push(meta);
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn get_file(&mut self, plugin: &str, filename: &str) -> Result<Option<FileEntry>> {
-        let r = self.client.call(
-            "loom.file_get",
-            Value::Array(vec![Value::from(plugin), Value::from(filename)]),
-        )?;
-        // Tarantool returns the tuple directly, but iproto wraps in array; result here is
-        // [tuple] or [].
-        if let Value::Array(arr) = r {
-            if let Some(tuple) = arr.into_iter().next() {
-                if matches!(tuple, Value::Nil) {
-                    return Ok(None);
-                }
-                return Ok(parse_file_tuple_full(&tuple));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn upsert_file(&mut self, plugin: &str, filename: &str, raw: &[u8]) -> Result<()> {
-        self.client.call(
-            "loom.file_upsert",
-            Value::Array(vec![
-                Value::from(plugin),
-                Value::from(filename),
-                Value::from(raw),
-            ]),
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_file(&mut self, plugin: &str, filename: &str) -> Result<()> {
-        self.client.call(
-            "loom.file_delete",
-            Value::Array(vec![Value::from(plugin), Value::from(filename)]),
-        )?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FileMeta {
     pub plugin: String,
     pub filename: String,
@@ -299,17 +290,84 @@ pub struct FileEntry {
     pub raw: Vec<u8>,
 }
 
+pub struct LoomApi {
+    pub client: Client,
+}
+
+impl LoomApi {
+    pub async fn list_plugins(&self) -> Result<Vec<String>> {
+        let r = self
+            .client
+            .call("loom.file_list_plugins", Value::Array(vec![]))
+            .await?;
+        let arr = unwrap_call_result(r);
+        Ok(arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
+    pub async fn list_files(&self, plugin: &str) -> Result<Vec<FileMeta>> {
+        let r = self
+            .client
+            .call("loom.file_list", Value::Array(vec![Value::from(plugin)]))
+            .await?;
+        let arr = unwrap_call_result(r);
+        Ok(arr.iter().filter_map(parse_file_tuple).collect())
+    }
+
+    pub async fn get_file(&self, plugin: &str, filename: &str) -> Result<Option<FileEntry>> {
+        let r = self
+            .client
+            .call(
+                "loom.file_get",
+                Value::Array(vec![Value::from(plugin), Value::from(filename)]),
+            )
+            .await?;
+        if let Value::Array(arr) = r {
+            if let Some(tuple) = arr.into_iter().next() {
+                if matches!(tuple, Value::Nil) {
+                    return Ok(None);
+                }
+                return Ok(parse_file_tuple_full(&tuple));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn upsert_file(&self, plugin: &str, filename: &str, raw: &[u8]) -> Result<()> {
+        self.client
+            .call(
+                "loom.file_upsert",
+                Value::Array(vec![
+                    Value::from(plugin),
+                    Value::from(filename),
+                    Value::from(raw),
+                ]),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_file(&self, plugin: &str, filename: &str) -> Result<()> {
+        self.client
+            .call(
+                "loom.file_delete",
+                Value::Array(vec![Value::from(plugin), Value::from(filename)]),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 fn unwrap_call_result(v: Value) -> Vec<Value> {
-    // Tarantool CALL returns multiple results as an outer array.
-    // For our functions returning a single table, we get [[...]].
     match v {
         Value::Array(arr) => {
             if arr.len() == 1 {
                 if let Value::Array(inner) = arr.into_iter().next().unwrap() {
                     return inner;
-                } else {
-                    return vec![];
                 }
+                return vec![];
             }
             arr
         }
@@ -344,7 +402,12 @@ fn parse_file_tuple_full(t: &Value) -> Option<FileEntry> {
             let mtime = fields[3].as_u64().unwrap_or(0);
             let size = fields[4].as_u64().unwrap_or(raw.len() as u64);
             return Some(FileEntry {
-                meta: FileMeta { plugin, filename, mtime, size },
+                meta: FileMeta {
+                    plugin,
+                    filename,
+                    mtime,
+                    size,
+                },
                 raw,
             });
         }

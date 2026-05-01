@@ -25,11 +25,9 @@ class MyPlugin : JavaPlugin() {
 
 ## FUSE sidecar runtime requirements
 
-```
-# Set by the k8s pod spec, not in the image:
-#   securityContext.capabilities.add: ["SYS_ADMIN"]   # required to mount FUSE
-#   /dev/fuse exposed as a volumeDevice or hostPath CharDevice
-#
-# `privileged: true` is sufficient but heavier than necessary — prefer the
-# narrow cap + device approach above.
-```
+Set by the k8s pod spec (not baked into the image):
+
+- `securityContext.capabilities.add: ["SYS_ADMIN"]` — required to mount FUSE.
+- `/dev/fuse` exposed as a `volumeDevice` or `hostPath` CharDevice.
+
+`privileged: true` works but is unnecessarily broad — prefer the narrow cap + device approach.

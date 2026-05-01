@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  kotlin:
+    name: Kotlin (lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 24
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 24
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build & test :lib
+        run: gradle :lib:test :lib:jar --no-daemon --stacktrace
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-jar
+          path: lib/build/libs/loom-*.jar
+
+  rust:
+    name: Rust sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuse3 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfuse3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar
+
+      - name: Cargo fmt check
+        working-directory: sidecar
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        working-directory: sidecar
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Cargo build (release)
+        working-directory: sidecar
+        run: cargo build --release --locked || cargo build --release
+
+  lua:
+    name: Tarantool init.lua syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install luac
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+      - name: Validate init.lua
+        run: |
+          if [ -f tarantool/init.lua ]; then
+            luac5.3 -p tarantool/init.lua
+          else
+            echo "no tarantool/init.lua to validate"; exit 0
+          fi
