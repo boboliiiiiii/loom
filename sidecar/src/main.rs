@@ -14,9 +14,9 @@ use anyhow::Result;
 use fuser::{
     BsdFileFlags, FileAttr, FileHandle, FileType, Filesystem, INodeNo, LockOwner, MountOption,
     OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use libc::{EIO, ENOENT, ENOTDIR, EROFS};
+use libc::{EIO, ENODATA, ENOENT, ENOTDIR, EROFS};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -811,6 +811,26 @@ impl Filesystem for LoomFS {
         let _ = s.persist_fh(fh);
         s.open_files.remove(&fh);
         reply.ok();
+    }
+
+    /// We don't store extended attributes. Return ENODATA so the kernel knows
+    /// "no such xattr on this file" instead of "FS doesn't support xattrs" —
+    /// otherwise fuser logs a WARN on every getxattr (which Linux fires on
+    /// every open() to check security.capability).
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(fuser::Errno::from_i32(ENODATA));
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        // empty list; size = 0
+        reply.size(0);
     }
 
     fn create(
