@@ -1,0 +1,21 @@
+[package]
+name = "loom-sidecar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fuser = "0.17"
+rmp = "0.8"
+rmpv = "1.3"
+libc = "0.2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha1 = "0.11"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+codegen-units = 1
