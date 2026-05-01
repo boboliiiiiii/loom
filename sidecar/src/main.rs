@@ -7,6 +7,13 @@
 //!
 //! Inside Tarantool plugin dirs, nested subdirs are virtual (filename has `/`).
 //! Inside passthrough dirs, everything is real FS.
+//!
+//! Concurrency: state is split across two short-lived mutexes (`InodeState`
+//! and `open_files`) so Tarantool I/O *never* runs under a FS lock. The lock
+//! is taken once to read the inode entry, dropped before any iproto call,
+//! and re-taken briefly to commit the result. This lets multi-threaded
+//! fuser configurations (or just a slow Tarantool) avoid serializing the
+//! whole filesystem behind a single Mutex.
 
 mod tarantool;
 
@@ -47,50 +54,23 @@ struct WriteBuf {
     dirty: bool,
 }
 
-/// Mutable state. All Filesystem callbacks lock the parent [LoomFS]'s
-/// `Mutex<Inner>` once and operate on this. fuser dispatches callbacks
-/// from a single thread by default, so contention is nil.
-struct Inner {
-    api: Arc<tarantool::LoomApi>,
-    rt: tokio::runtime::Handle,
-    pass_root: PathBuf,
+/// Inode/path bookkeeping. Held under [LoomFS::state] in a short critical
+/// section — never across an iproto call.
+struct InodeState {
     inodes: HashMap<u64, Entry>,
     paths: HashMap<String, u64>,
     next_ino: u64,
     next_fh: u64,
-    open_files: HashMap<u64, WriteBuf>,
     ghost_dirs: HashSet<(String, String)>,
 }
 
-struct LoomFS {
-    state: Mutex<Inner>,
-}
-
-fn is_passthrough_root_name(name: &str) -> bool {
-    name.starts_with('.') || name.starts_with("tmp-")
-}
-
-fn ino_u64(ino: INodeNo) -> u64 {
-    ino.0
-}
-fn fh_u64(fh: FileHandle) -> u64 {
-    fh.0
-}
-
-impl Inner {
-    fn new(api: Arc<tarantool::LoomApi>, rt: tokio::runtime::Handle, pass_root: PathBuf) -> Self {
-        if !pass_root.exists() {
-            let _ = fs::create_dir_all(&pass_root);
-        }
+impl InodeState {
+    fn new() -> Self {
         let mut s = Self {
-            api,
-            rt,
-            pass_root,
             inodes: HashMap::new(),
             paths: HashMap::new(),
             next_ino: FIRST_INO,
             next_fh: 1,
-            open_files: HashMap::new(),
             ghost_dirs: HashSet::new(),
         };
         s.inodes.insert(ROOT_INO, Entry::Root);
@@ -110,14 +90,56 @@ impl Inner {
         i
     }
 
-    fn list_plugins(&mut self) -> Vec<String> {
+    fn next_fh(&mut self) -> u64 {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        fh
+    }
+}
+
+struct LoomFS {
+    api: Arc<tarantool::LoomApi>,
+    rt: tokio::runtime::Handle,
+    pass_root: Arc<PathBuf>,
+    state: Mutex<InodeState>,
+    open_files: Mutex<HashMap<u64, WriteBuf>>,
+}
+
+fn is_passthrough_root_name(name: &str) -> bool {
+    name.starts_with('.') || name.starts_with("tmp-")
+}
+
+fn ino_u64(ino: INodeNo) -> u64 {
+    ino.0
+}
+fn fh_u64(fh: FileHandle) -> u64 {
+    fh.0
+}
+
+impl LoomFS {
+    fn new(api: Arc<tarantool::LoomApi>, rt: tokio::runtime::Handle, pass_root: PathBuf) -> Self {
+        if !pass_root.exists() {
+            let _ = fs::create_dir_all(&pass_root);
+        }
+        Self {
+            api,
+            rt,
+            pass_root: Arc::new(pass_root),
+            state: Mutex::new(InodeState::new()),
+            open_files: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // === Tarantool wrappers — never hold any lock here. ===
+
+    fn list_plugins(&self) -> Vec<String> {
         let api = Arc::clone(&self.api);
         self.rt
             .block_on(async move { api.list_plugins().await })
             .unwrap_or_default()
     }
 
-    fn list_files(&mut self, plugin: &str) -> Vec<tarantool::FileMeta> {
+    fn list_files(&self, plugin: &str) -> Vec<tarantool::FileMeta> {
         let api = Arc::clone(&self.api);
         let plugin = plugin.to_string();
         self.rt
@@ -125,7 +147,7 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    fn get_file(&mut self, plugin: &str, filename: &str) -> Option<tarantool::FileEntry> {
+    fn get_file(&self, plugin: &str, filename: &str) -> Option<tarantool::FileEntry> {
         let api = Arc::clone(&self.api);
         let plugin = plugin.to_string();
         let filename = filename.to_string();
@@ -135,7 +157,7 @@ impl Inner {
             .flatten()
     }
 
-    fn upsert_file(&mut self, plugin: &str, filename: &str, raw: &[u8]) -> Result<()> {
+    fn upsert_file(&self, plugin: &str, filename: &str, raw: &[u8]) -> Result<()> {
         let api = Arc::clone(&self.api);
         let plugin = plugin.to_string();
         let filename = filename.to_string();
@@ -144,7 +166,7 @@ impl Inner {
             .block_on(async move { api.upsert_file(&plugin, &filename, &raw).await })
     }
 
-    fn delete_file(&mut self, plugin: &str, filename: &str) -> Result<()> {
+    fn delete_file(&self, plugin: &str, filename: &str) -> Result<()> {
         let api = Arc::clone(&self.api);
         let plugin = plugin.to_string();
         let filename = filename.to_string();
@@ -152,13 +174,86 @@ impl Inner {
             .block_on(async move { api.delete_file(&plugin, &filename).await })
     }
 
-    fn list_dir_children(&mut self, plugin: &str, prefix: &str) -> Vec<(String, bool)> {
+    // === Inode state helpers — brief lock, no I/O. ===
+
+    fn get_inode(&self, ino: u64) -> Option<Entry> {
+        self.state.lock().unwrap().inodes.get(&ino).cloned()
+    }
+
+    fn lookup_path(&self, path: &str) -> Option<u64> {
+        self.state.lock().unwrap().paths.get(path).copied()
+    }
+
+    fn alloc_inode(&self, path: &str, entry: Entry) -> u64 {
+        self.state.lock().unwrap().alloc_inode(path, entry)
+    }
+
+    fn remove_path(&self, path: &str) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(ino) = s.paths.remove(path) {
+            s.inodes.remove(&ino);
+        }
+    }
+
+    fn add_ghost_dir(&self, plugin: &str, dir: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .ghost_dirs
+            .insert((plugin.to_string(), dir.to_string()));
+    }
+
+    fn remove_ghost_dir(&self, plugin: &str, dir: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .ghost_dirs
+            .remove(&(plugin.to_string(), dir.to_string()));
+    }
+
+    fn has_ghost_dir(&self, plugin: &str, dir: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .ghost_dirs
+            .contains(&(plugin.to_string(), dir.to_string()))
+    }
+
+    fn ghost_dirs_under(&self, plugin: &str, prefix: &str) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.ghost_dirs
+            .iter()
+            .filter(|(p, d)| p == plugin && d.starts_with(prefix))
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    fn ghost_dirs_for_plugin(&self, plugin: &str) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.ghost_dirs
+            .iter()
+            .filter(|(p, _)| p == plugin)
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    fn next_fh(&self) -> u64 {
+        self.state.lock().unwrap().next_fh()
+    }
+
+    // === Composite operations. ===
+
+    /// Merge Tarantool file list with locally-tracked ghost dirs into a flat
+    /// list of `(name, is_file)` children of `prefix` inside `plugin`.
+    fn list_dir_children(&self, plugin: &str, prefix: &str) -> Vec<(String, bool)> {
         let pws = if prefix.is_empty() {
             String::new()
         } else {
             format!("{}/", prefix)
         };
-        let files = self.list_files(plugin);
+        let files = self.list_files(plugin); // no lock held
+        let ghost_dirs = self.ghost_dirs_for_plugin(plugin); // brief lock
+
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<(String, bool)> = Vec::new();
         for f in &files {
@@ -183,10 +278,7 @@ impl Inner {
                 }
             }
         }
-        for (gp, gd) in &self.ghost_dirs {
-            if gp != plugin {
-                continue;
-            }
+        for gd in &ghost_dirs {
             let parent = match gd.rfind('/') {
                 Some(i) => &gd[..i],
                 None => "",
@@ -204,20 +296,28 @@ impl Inner {
         out
     }
 
-    fn persist_fh(&mut self, fh: u64) -> Result<()> {
-        let need = matches!(self.open_files.get(&fh), Some(b) if b.dirty);
-        if !need {
-            return Ok(());
-        }
-        let (pass_real, plugin, filename, bytes) = {
-            let b = self.open_files.get(&fh).unwrap();
-            (
-                b.pass_real.clone(),
-                b.plugin.clone(),
-                b.filename.clone(),
-                b.bytes.clone(),
-            )
+    /// Flush a dirty open file to its backing store. Locks are released
+    /// around the actual upsert so concurrent fh's don't pile up.
+    fn persist_fh(&self, fh: u64) -> Result<()> {
+        // Phase 1: snapshot under open_files lock.
+        let snapshot = {
+            let of = self.open_files.lock().unwrap();
+            match of.get(&fh) {
+                Some(b) if b.dirty => Some((
+                    b.pass_real.clone(),
+                    b.plugin.clone(),
+                    b.filename.clone(),
+                    b.bytes.clone(),
+                )),
+                _ => None,
+            }
         };
+        let (pass_real, plugin, filename, bytes) = match snapshot {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        // Phase 2: I/O without any lock.
         if let Some(real) = pass_real {
             if let Some(parent) = real.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -231,10 +331,15 @@ impl Inner {
             f.flush()?;
         } else {
             self.upsert_file(&plugin, &filename, &bytes)?;
-            self.ghost_dirs
+            // Drop ghost-dir prefixes that were rooted at this file's path.
+            let mut s = self.state.lock().unwrap();
+            s.ghost_dirs
                 .retain(|(p, d)| !(p == &plugin && filename.starts_with(&format!("{}/", d))));
         }
-        if let Some(b) = self.open_files.get_mut(&fh) {
+
+        // Phase 3: clear dirty flag.
+        let mut of = self.open_files.lock().unwrap();
+        if let Some(b) = of.get_mut(&fh) {
             b.dirty = false;
         }
         Ok(())
@@ -341,18 +446,22 @@ impl Filesystem for LoomFS {
             }
         };
         debug!(parent, name = name_str, "lookup");
-        let mut s = self.state.lock().unwrap();
 
-        match s.inodes.get(&parent).cloned() {
+        let parent_entry = self.get_inode(parent);
+        match parent_entry {
             Some(Entry::Root) => {
                 let path = format!("/{}", name_str);
-                if let Some(&ino) = s.paths.get(&path) {
-                    match s.inodes.get(&ino).cloned() {
-                        Some(Entry::Dir { .. }) => {
+
+                // Check inode cache first.
+                if let Some(ino) = self.lookup_path(&path)
+                    && let Some(entry) = self.get_inode(ino)
+                {
+                    match entry {
+                        Entry::Dir { .. } => {
                             reply.entry(&TTL, &dir_attr(ino), fuser::Generation(0));
                             return;
                         }
-                        Some(Entry::Pass { real, .. }) => {
+                        Entry::Pass { real, .. } => {
                             if let Some(attr) = pass_attr(ino, &real) {
                                 reply.entry(&TTL, &attr, fuser::Generation(0));
                                 return;
@@ -361,10 +470,12 @@ impl Filesystem for LoomFS {
                         _ => {}
                     }
                 }
-                let real = s.pass_root.join(name_str);
+
+                // Try passthrough disk.
+                let real = self.pass_root.join(name_str);
                 if let Ok(meta) = fs::symlink_metadata(&real) {
                     let is_dir = meta.is_dir();
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &path,
                         Entry::Pass {
                             real: real.clone(),
@@ -376,9 +487,11 @@ impl Filesystem for LoomFS {
                         return;
                     }
                 }
-                let plugins = s.list_plugins();
+
+                // Fallback to Tarantool plugin list (no lock held during the call).
+                let plugins = self.list_plugins();
                 if plugins.iter().any(|p| p == name_str) {
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &path,
                         Entry::Dir {
                             plugin: name_str.to_string(),
@@ -392,9 +505,11 @@ impl Filesystem for LoomFS {
             }
             Some(Entry::Dir { plugin, prefix }) => {
                 let child_path = join_path(&prefix, name_str);
-                if let Some(entry) = s.get_file(&plugin, &child_path) {
+
+                // Try as a file (Tarantool call without lock).
+                if let Some(entry) = self.get_file(&plugin, &child_path) {
                     let fp = fs_path_for(&plugin, &child_path);
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &fp,
                         Entry::File {
                             plugin: plugin.clone(),
@@ -408,13 +523,15 @@ impl Filesystem for LoomFS {
                     );
                     return;
                 }
+
+                // Try as a virtual directory.
                 let pwc = format!("{}/", child_path);
-                let files = s.list_files(&plugin);
+                let files = self.list_files(&plugin);
                 let is_real_dir = files.iter().any(|f| f.filename.starts_with(&pwc));
-                let is_ghost = s.ghost_dirs.contains(&(plugin.clone(), child_path.clone()));
+                let is_ghost = self.has_ghost_dir(&plugin, &child_path);
                 if is_real_dir || is_ghost {
                     let fp = fs_path_for(&plugin, &child_path);
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &fp,
                         Entry::Dir {
                             plugin,
@@ -431,10 +548,10 @@ impl Filesystem for LoomFS {
                 is_dir: true,
             }) => {
                 let real = parent_real.join(name_str);
-                if let Ok(_meta) = fs::symlink_metadata(&real) {
+                if fs::symlink_metadata(&real).is_ok() {
                     let is_dir = real.is_dir();
                     let key = pass_fs_path(&real);
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &key,
                         Entry::Pass {
                             real: real.clone(),
@@ -474,17 +591,20 @@ impl Filesystem for LoomFS {
         reply: ReplyAttr,
     ) {
         let ino = ino_u64(ino);
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&ino).cloned() {
+        let entry = self.get_inode(ino);
+        match entry {
             Some(Entry::File { plugin, filename }) => {
                 if let Some(new_size) = size {
-                    let mut bytes = s
+                    let mut bytes = self
                         .get_file(&plugin, &filename)
                         .map(|e| e.raw)
                         .unwrap_or_default();
                     bytes.resize(new_size as usize, 0);
-                    let _ = s.upsert_file(&plugin, &filename, &bytes);
-                    for buf in s.open_files.values_mut() {
+                    let _ = self.upsert_file(&plugin, &filename, &bytes);
+
+                    // Propagate size to in-flight write buffers (separate lock).
+                    let mut of = self.open_files.lock().unwrap();
+                    for buf in of.values_mut() {
                         if buf.pass_real.is_none()
                             && buf.plugin == plugin
                             && buf.filename == filename
@@ -498,7 +618,7 @@ impl Filesystem for LoomFS {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let sz = s
+                let sz = self
                     .get_file(&plugin, &filename)
                     .map(|e| e.meta.size)
                     .unwrap_or(0);
@@ -517,7 +637,8 @@ impl Filesystem for LoomFS {
                     {
                         let _ = f.set_len(new_size);
                     }
-                    for buf in s.open_files.values_mut() {
+                    let mut of = self.open_files.lock().unwrap();
+                    for buf in of.values_mut() {
                         if buf.pass_real.as_deref() == Some(real.as_path()) {
                             buf.bytes.resize(new_size as usize, 0);
                             buf.dirty = true;
@@ -544,11 +665,11 @@ impl Filesystem for LoomFS {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let ino = ino_u64(ino);
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&ino).cloned() {
+        let entry = self.get_inode(ino);
+        match entry {
             Some(Entry::Root) | Some(Entry::Dir { .. }) => reply.attr(&TTL, &dir_attr(ino)),
             Some(Entry::File { plugin, filename }) => {
-                if let Some(e) = s.get_file(&plugin, &filename) {
+                if let Some(e) = self.get_file(&plugin, &filename) {
                     reply.attr(&TTL, &file_attr(ino, e.meta.size, e.meta.mtime));
                 } else {
                     reply.error(fuser::Errno::from_i32(ENOENT));
@@ -574,16 +695,18 @@ impl Filesystem for LoomFS {
         mut reply: ReplyDirectory,
     ) {
         let ino = ino_u64(ino);
-        let mut s = self.state.lock().unwrap();
+        let entry = self.get_inode(ino);
+
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".into()),
             (ino, FileType::Directory, "..".into()),
         ];
-        match s.inodes.get(&ino).cloned() {
+        match entry {
             Some(Entry::Root) => {
-                for plugin in s.list_plugins() {
+                // Tarantool listing without lock.
+                for plugin in self.list_plugins() {
                     let path = format!("/{}", plugin);
-                    let i = s.alloc_inode(
+                    let i = self.alloc_inode(
                         &path,
                         Entry::Dir {
                             plugin: plugin.clone(),
@@ -592,14 +715,14 @@ impl Filesystem for LoomFS {
                     );
                     entries.push((i, FileType::Directory, plugin));
                 }
-                let pass_root = s.pass_root.clone();
-                if let Ok(rd) = fs::read_dir(&pass_root) {
+                let pass_root = Arc::clone(&self.pass_root);
+                if let Ok(rd) = fs::read_dir(pass_root.as_path()) {
                     for de in rd.flatten() {
                         let name = de.file_name().to_string_lossy().to_string();
                         let real = de.path();
                         let is_dir = real.is_dir();
                         let key = format!("/{}", name);
-                        let i = s.alloc_inode(&key, Entry::Pass { real, is_dir });
+                        let i = self.alloc_inode(&key, Entry::Pass { real, is_dir });
                         let kind = if is_dir {
                             FileType::Directory
                         } else {
@@ -610,11 +733,11 @@ impl Filesystem for LoomFS {
                 }
             }
             Some(Entry::Dir { plugin, prefix }) => {
-                for (name, is_file) in s.list_dir_children(&plugin, &prefix) {
+                for (name, is_file) in self.list_dir_children(&plugin, &prefix) {
                     let child = join_path(&prefix, &name);
                     let fp = fs_path_for(&plugin, &child);
                     if is_file {
-                        let i = s.alloc_inode(
+                        let i = self.alloc_inode(
                             &fp,
                             Entry::File {
                                 plugin: plugin.clone(),
@@ -623,7 +746,7 @@ impl Filesystem for LoomFS {
                         );
                         entries.push((i, FileType::RegularFile, name));
                     } else {
-                        let i = s.alloc_inode(
+                        let i = self.alloc_inode(
                             &fp,
                             Entry::Dir {
                                 plugin: plugin.clone(),
@@ -641,7 +764,7 @@ impl Filesystem for LoomFS {
                         let p = de.path();
                         let is_dir = p.is_dir();
                         let key = pass_fs_path(&p);
-                        let i = s.alloc_inode(&key, Entry::Pass { real: p, is_dir });
+                        let i = self.alloc_inode(&key, Entry::Pass { real: p, is_dir });
                         let kind = if is_dir {
                             FileType::Directory
                         } else {
@@ -668,19 +791,19 @@ impl Filesystem for LoomFS {
         let ino = ino_u64(ino);
         let flags_raw: i32 = unsafe { std::mem::transmute::<OpenFlags, i32>(flags) };
         let truncate = (flags_raw & libc::O_TRUNC) != 0;
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&ino).cloned() {
+        let entry = self.get_inode(ino);
+
+        match entry {
             Some(Entry::File { plugin, filename }) => {
                 let bytes = if truncate {
                     Vec::new()
                 } else {
-                    s.get_file(&plugin, &filename)
+                    self.get_file(&plugin, &filename)
                         .map(|e| e.raw)
                         .unwrap_or_default()
                 };
-                let fh = s.next_fh;
-                s.next_fh += 1;
-                s.open_files.insert(
+                let fh = self.next_fh();
+                self.open_files.lock().unwrap().insert(
                     fh,
                     WriteBuf {
                         bytes,
@@ -701,9 +824,8 @@ impl Filesystem for LoomFS {
                 } else {
                     fs::read(&real).unwrap_or_default()
                 };
-                let fh = s.next_fh;
-                s.next_fh += 1;
-                s.open_files.insert(
+                let fh = self.next_fh();
+                self.open_files.lock().unwrap().insert(
                     fh,
                     WriteBuf {
                         bytes,
@@ -731,8 +853,8 @@ impl Filesystem for LoomFS {
         reply: ReplyData,
     ) {
         let fh = fh_u64(fh);
-        let s = self.state.lock().unwrap();
-        let buf = match s.open_files.get(&fh) {
+        let of = self.open_files.lock().unwrap();
+        let buf = match of.get(&fh) {
             Some(b) => b,
             None => {
                 reply.error(fuser::Errno::from_i32(EIO));
@@ -761,8 +883,8 @@ impl Filesystem for LoomFS {
         reply: ReplyWrite,
     ) {
         let fh = fh_u64(fh);
-        let mut s = self.state.lock().unwrap();
-        let buf = match s.open_files.get_mut(&fh) {
+        let mut of = self.open_files.lock().unwrap();
+        let buf = match of.get_mut(&fh) {
             Some(b) => b,
             None => {
                 reply.error(fuser::Errno::from_i32(EIO));
@@ -788,8 +910,7 @@ impl Filesystem for LoomFS {
         reply: ReplyEmpty,
     ) {
         let fh = fh_u64(fh);
-        let mut s = self.state.lock().unwrap();
-        if s.persist_fh(fh).is_err() {
+        if self.persist_fh(fh).is_err() {
             reply.error(fuser::Errno::from_i32(EIO));
             return;
         }
@@ -807,9 +928,8 @@ impl Filesystem for LoomFS {
         reply: ReplyEmpty,
     ) {
         let fh = fh_u64(fh);
-        let mut s = self.state.lock().unwrap();
-        let _ = s.persist_fh(fh);
-        s.open_files.remove(&fh);
+        let _ = self.persist_fh(fh);
+        self.open_files.lock().unwrap().remove(&fh);
         reply.ok();
     }
 
@@ -829,7 +949,6 @@ impl Filesystem for LoomFS {
     }
 
     fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        // empty list; size = 0
         reply.size(0);
     }
 
@@ -855,10 +974,11 @@ impl Filesystem for LoomFS {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&parent).cloned() {
+        let parent_entry = self.get_inode(parent);
+
+        match parent_entry {
             Some(Entry::Root) => {
-                let real = s.pass_root.join(&name_str);
+                let real = self.pass_root.join(&name_str);
                 if let Some(p) = real.parent() {
                     let _ = fs::create_dir_all(p);
                 }
@@ -868,7 +988,7 @@ impl Filesystem for LoomFS {
                     return;
                 }
                 let key = format!("/{}", name_str);
-                let ino = s.alloc_inode(
+                let ino = self.alloc_inode(
                     &key,
                     Entry::Pass {
                         real: real.clone(),
@@ -876,9 +996,8 @@ impl Filesystem for LoomFS {
                     },
                 );
                 let attr = pass_attr(ino, &real).unwrap_or_else(|| file_attr(ino, 0, now));
-                let fh = s.next_fh;
-                s.next_fh += 1;
-                s.open_files.insert(
+                let fh = self.next_fh();
+                self.open_files.lock().unwrap().insert(
                     fh,
                     WriteBuf {
                         bytes: Vec::new(),
@@ -898,21 +1017,25 @@ impl Filesystem for LoomFS {
             }
             Some(Entry::Dir { plugin, prefix }) => {
                 let filename = join_path(&prefix, &name_str);
-                if let Err(e) = s.upsert_file(&plugin, &filename, &[]) {
+                if let Err(e) = self.upsert_file(&plugin, &filename, &[]) {
                     error!(error = %e, "create upsert");
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let mut p = String::new();
-                for seg in filename.split('/').take(filename.matches('/').count()) {
-                    if !p.is_empty() {
-                        p.push('/');
+                // Drop ghost-dirs that just became real prefixes of this file.
+                {
+                    let mut s = self.state.lock().unwrap();
+                    let mut p = String::new();
+                    for seg in filename.split('/').take(filename.matches('/').count()) {
+                        if !p.is_empty() {
+                            p.push('/');
+                        }
+                        p.push_str(seg);
+                        s.ghost_dirs.remove(&(plugin.clone(), p.clone()));
                     }
-                    p.push_str(seg);
-                    s.ghost_dirs.remove(&(plugin.clone(), p.clone()));
                 }
                 let fp = fs_path_for(&plugin, &filename);
-                let ino = s.alloc_inode(
+                let ino = self.alloc_inode(
                     &fp,
                     Entry::File {
                         plugin: plugin.clone(),
@@ -920,9 +1043,8 @@ impl Filesystem for LoomFS {
                     },
                 );
                 let attr = file_attr(ino, 0, now);
-                let fh = s.next_fh;
-                s.next_fh += 1;
-                s.open_files.insert(
+                let fh = self.next_fh();
+                self.open_files.lock().unwrap().insert(
                     fh,
                     WriteBuf {
                         bytes: Vec::new(),
@@ -954,7 +1076,7 @@ impl Filesystem for LoomFS {
                     return;
                 }
                 let key = pass_fs_path(&real);
-                let ino = s.alloc_inode(
+                let ino = self.alloc_inode(
                     &key,
                     Entry::Pass {
                         real: real.clone(),
@@ -962,9 +1084,8 @@ impl Filesystem for LoomFS {
                     },
                 );
                 let attr = pass_attr(ino, &real).unwrap_or_else(|| file_attr(ino, 0, now));
-                let fh = s.next_fh;
-                s.next_fh += 1;
-                s.open_files.insert(
+                let fh = self.next_fh();
+                self.open_files.lock().unwrap().insert(
                     fh,
                     WriteBuf {
                         bytes: Vec::new(),
@@ -995,32 +1116,26 @@ impl Filesystem for LoomFS {
                 return;
             }
         };
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&parent).cloned() {
+        let parent_entry = self.get_inode(parent);
+        match parent_entry {
             Some(Entry::Root) => {
-                let real = s.pass_root.join(name_str);
+                let real = self.pass_root.join(name_str);
                 if let Err(e) = fs::remove_file(&real) {
                     error!(error = %e, "pass unlink");
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let key = format!("/{}", name_str);
-                if let Some(ino) = s.paths.remove(&key) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_path(&format!("/{}", name_str));
                 reply.ok();
             }
             Some(Entry::Dir { plugin, prefix }) => {
                 let filename = join_path(&prefix, name_str);
-                if let Err(e) = s.delete_file(&plugin, &filename) {
+                if let Err(e) = self.delete_file(&plugin, &filename) {
                     error!(error = %e, "delete");
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let fp = fs_path_for(&plugin, &filename);
-                if let Some(ino) = s.paths.remove(&fp) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_path(&fs_path_for(&plugin, &filename));
                 reply.ok();
             }
             Some(Entry::Pass {
@@ -1033,10 +1148,7 @@ impl Filesystem for LoomFS {
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let key = pass_fs_path(&real);
-                if let Some(ino) = s.paths.remove(&key) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_path(&pass_fs_path(&real));
                 reply.ok();
             }
             _ => reply.error(fuser::Errno::from_i32(ENOTDIR)),
@@ -1060,13 +1172,13 @@ impl Filesystem for LoomFS {
                 return;
             }
         };
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&parent).cloned() {
+        let parent_entry = self.get_inode(parent);
+        match parent_entry {
             Some(Entry::Dir { plugin, prefix }) => {
                 let dirpath = join_path(&prefix, &name_str);
-                s.ghost_dirs.insert((plugin.clone(), dirpath.clone()));
+                self.add_ghost_dir(&plugin, &dirpath);
                 let fp = fs_path_for(&plugin, &dirpath);
-                let ino = s.alloc_inode(
+                let ino = self.alloc_inode(
                     &fp,
                     Entry::Dir {
                         plugin,
@@ -1077,14 +1189,14 @@ impl Filesystem for LoomFS {
             }
             Some(Entry::Root) => {
                 if is_passthrough_root_name(&name_str) {
-                    let real = s.pass_root.join(&name_str);
+                    let real = self.pass_root.join(&name_str);
                     if let Err(e) = fs::create_dir_all(&real) {
                         error!(error = %e, "pass mkdir");
                         reply.error(fuser::Errno::from_i32(EIO));
                         return;
                     }
                     let key = format!("/{}", name_str);
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &key,
                         Entry::Pass {
                             real: real.clone(),
@@ -1095,7 +1207,7 @@ impl Filesystem for LoomFS {
                     reply.entry(&TTL, &attr, fuser::Generation(0));
                 } else {
                     let path = format!("/{}", name_str);
-                    let ino = s.alloc_inode(
+                    let ino = self.alloc_inode(
                         &path,
                         Entry::Dir {
                             plugin: name_str.clone(),
@@ -1116,7 +1228,7 @@ impl Filesystem for LoomFS {
                     return;
                 }
                 let key = pass_fs_path(&real);
-                let ino = s.alloc_inode(
+                let ino = self.alloc_inode(
                     &key,
                     Entry::Pass {
                         real: real.clone(),
@@ -1139,41 +1251,33 @@ impl Filesystem for LoomFS {
                 return;
             }
         };
-        let mut s = self.state.lock().unwrap();
-        match s.inodes.get(&parent).cloned() {
+        let parent_entry = self.get_inode(parent);
+        match parent_entry {
             Some(Entry::Dir { plugin, prefix }) => {
                 let dirpath = join_path(&prefix, name_str);
                 let pref = format!("{}/", dirpath);
-                let files = s.list_files(&plugin);
+                let files = self.list_files(&plugin); // no lock
                 if files.iter().any(|f| f.filename.starts_with(&pref)) {
                     reply.error(fuser::Errno::from_i32(libc::ENOTEMPTY));
                     return;
                 }
-                if s.ghost_dirs
-                    .iter()
-                    .any(|(p, d)| p == &plugin && d.starts_with(&pref))
-                {
+                let nested = self.ghost_dirs_under(&plugin, &pref);
+                if !nested.is_empty() {
                     reply.error(fuser::Errno::from_i32(libc::ENOTEMPTY));
                     return;
                 }
-                s.ghost_dirs.remove(&(plugin.clone(), dirpath.clone()));
-                let fp = fs_path_for(&plugin, &dirpath);
-                if let Some(ino) = s.paths.remove(&fp) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_ghost_dir(&plugin, &dirpath);
+                self.remove_path(&fs_path_for(&plugin, &dirpath));
                 reply.ok();
             }
             Some(Entry::Root) => {
-                let real = s.pass_root.join(name_str);
+                let real = self.pass_root.join(name_str);
                 if let Err(e) = fs::remove_dir(&real) {
                     error!(error = %e, "pass rmdir");
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let key = format!("/{}", name_str);
-                if let Some(ino) = s.paths.remove(&key) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_path(&format!("/{}", name_str));
                 reply.ok();
             }
             Some(Entry::Pass {
@@ -1186,10 +1290,7 @@ impl Filesystem for LoomFS {
                     reply.error(fuser::Errno::from_i32(EIO));
                     return;
                 }
-                let key = pass_fs_path(&real);
-                if let Some(ino) = s.paths.remove(&key) {
-                    s.inodes.remove(&ino);
-                }
+                self.remove_path(&pass_fs_path(&real));
                 reply.ok();
             }
             _ => reply.error(fuser::Errno::from_i32(ENOTDIR)),
@@ -1209,7 +1310,7 @@ impl Filesystem for LoomFS {
         let parent = ino_u64(parent);
         let newparent = ino_u64(newparent);
         let n1 = match name.to_str() {
-            Some(s) => s,
+            Some(s) => s.to_string(),
             None => {
                 reply.error(fuser::Errno::from_i32(ENOENT));
                 return;
@@ -1222,14 +1323,20 @@ impl Filesystem for LoomFS {
                 return;
             }
         };
-        let mut s = self.state.lock().unwrap();
-        let p1 = s.inodes.get(&parent).cloned();
-        let p2 = s.inodes.get(&newparent).cloned();
-        let pass_root = s.pass_root.clone();
+
+        // Snapshot both parent inode entries in one short critical section.
+        let (p1, p2) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.inodes.get(&parent).cloned(),
+                s.inodes.get(&newparent).cloned(),
+            )
+        };
+        let pass_root = Arc::clone(&self.pass_root);
 
         let from_pass = match &p1 {
-            Some(Entry::Root) => Some(pass_root.join(n1)),
-            Some(Entry::Pass { real, is_dir: true }) => Some(real.join(n1)),
+            Some(Entry::Root) => Some(pass_root.join(&n1)),
+            Some(Entry::Pass { real, is_dir: true }) => Some(real.join(&n1)),
             _ => None,
         };
         let to_pass = match &p2 {
@@ -1250,9 +1357,7 @@ impl Filesystem for LoomFS {
                 Some(Entry::Root) => format!("/{}", n1),
                 _ => pass_fs_path(&from),
             };
-            if let Some(ino) = s.paths.remove(&from_key) {
-                s.inodes.remove(&ino);
-            }
+            self.remove_path(&from_key);
             reply.ok();
             return;
         }
@@ -1268,27 +1373,25 @@ impl Filesystem for LoomFS {
             }),
         ) = (p1, p2)
         {
-            let old_full = join_path(&pra, n1);
+            let old_full = join_path(&pra, &n1);
             let new_full = join_path(&prb, &n2);
-            let entry = match s.get_file(&pa, &old_full) {
+            // Both reads/writes happen without any lock held.
+            let entry = match self.get_file(&pa, &old_full) {
                 Some(e) => e,
                 None => {
                     reply.error(fuser::Errno::from_i32(ENOENT));
                     return;
                 }
             };
-            if let Err(e) = s.upsert_file(&pb, &new_full, &entry.raw) {
+            if let Err(e) = self.upsert_file(&pb, &new_full, &entry.raw) {
                 error!(error = %e, "rename upsert");
                 reply.error(fuser::Errno::from_i32(EIO));
                 return;
             }
             if !(pa == pb && old_full == new_full) {
-                let _ = s.delete_file(&pa, &old_full);
+                let _ = self.delete_file(&pa, &old_full);
             }
-            let old_fs = fs_path_for(&pa, &old_full);
-            if let Some(ino) = s.paths.remove(&old_fs) {
-                s.inodes.remove(&ino);
-            }
+            self.remove_path(&fs_path_for(&pa, &old_full));
             reply.ok();
             return;
         }
@@ -1316,8 +1419,9 @@ fn main() -> Result<()> {
 
     info!(url = %tarantool_url, user = ?user, "connecting to tarantool");
 
-    // Build a multi-thread tokio runtime: tarantool I/O is async, FUSE callbacks are sync,
-    // and the runtime handle bridges them via `block_on`.
+    // Multi-thread tokio runtime: tarantool I/O is async, FUSE callbacks are sync.
+    // The runtime handle bridges them via `block_on` — but we never hold a state
+    // lock across one of those calls, so different fh's don't serialize.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1333,10 +1437,7 @@ fn main() -> Result<()> {
     info!("tarantool connected");
 
     let api = Arc::new(tarantool::LoomApi { client });
-    let inner = Inner::new(api, handle, pass_dir.clone());
-    let fs_impl = LoomFS {
-        state: Mutex::new(inner),
-    };
+    let fs_impl = LoomFS::new(api, handle, pass_dir.clone());
     info!(mount_point, pass_dir = %pass_dir.display(), "mounting FUSE");
     let mut config = fuser::Config::default();
     // Allow any uid in the pod to access the FUSE mount (Paper container may have a

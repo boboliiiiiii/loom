@@ -13,17 +13,59 @@ box.cfg{
 
 box.schema.space.create('configs_files', {
     if_not_exists = true,
-    format = {
-        {name = 'plugin',   type = 'string'},
-        {name = 'filename', type = 'string'},
-        {name = 'raw',      type = 'any'},
-        {name = 'mtime',    type = 'unsigned'},
-        {name = 'size',     type = 'unsigned'},
-    },
+})
+
+-- Migration: pre-versioning rows had 5 fields (no `version`). Pad with v=1
+-- before locking in the new format so the schema check stays satisfied.
+do
+    local current_fmt = box.space.configs_files:format()
+    if #current_fmt == 0 or #current_fmt < 6 then
+        for _, t in box.space.configs_files:pairs() do
+            if #t < 6 then
+                box.space.configs_files:update(
+                    {t.plugin, t.filename},
+                    {{'!', 6, 1}}
+                )
+            end
+        end
+    end
+end
+
+box.space.configs_files:format({
+    {name = 'plugin',   type = 'string'},
+    {name = 'filename', type = 'string'},
+    {name = 'raw',      type = 'any'},
+    {name = 'mtime',    type = 'unsigned'},
+    {name = 'size',     type = 'unsigned'},
+    {name = 'version',  type = 'unsigned'},
 })
 box.space.configs_files:create_index('pk', {
     if_not_exists = true,
     parts = {'plugin', 'filename'},
+})
+
+-- Append-only history of every file revision. Latest copy still lives in
+-- `configs_files`; previous revisions land here on every upsert/delete.
+box.schema.space.create('configs_history', {
+    if_not_exists = true,
+    format = {
+        {name = 'plugin',   type = 'string'},
+        {name = 'filename', type = 'string'},
+        {name = 'version',  type = 'unsigned'},
+        {name = 'raw',      type = 'any'},
+        {name = 'mtime',    type = 'unsigned'},
+        {name = 'size',     type = 'unsigned'},
+        {name = 'author',   type = 'string'},
+    },
+})
+box.space.configs_history:create_index('pk', {
+    if_not_exists = true,
+    parts = {'plugin', 'filename', 'version'},
+})
+box.space.configs_history:create_index('by_plugin_file', {
+    if_not_exists = true,
+    parts = {'plugin', 'filename'},
+    unique = false,
 })
 
 box.schema.space.create('configs_tree', {
@@ -71,12 +113,79 @@ function loom.file_get(plugin, filename)
     return box.space.configs_files:get{plugin, filename}
 end
 
-function loom.file_upsert(plugin, filename, raw)
-    return box.space.configs_files:replace{plugin, filename, raw, os.time(), #raw}
+function loom.file_upsert(plugin, filename, raw, author)
+    author = author or ''
+    box.begin()
+    local existing = box.space.configs_files:get{plugin, filename}
+    local new_version
+    if existing ~= nil then
+        new_version = existing.version + 1
+        box.space.configs_history:replace{
+            existing.plugin, existing.filename, existing.version,
+            existing.raw, existing.mtime, existing.size, ''
+        }
+    else
+        new_version = 1
+    end
+    local now = os.time()
+    local result = box.space.configs_files:replace{
+        plugin, filename, raw, now, #raw, new_version
+    }
+    -- Stamp the author on the freshly archived predecessor (if any). The
+    -- current row stays unstamped until the next upsert promotes it into
+    -- history.
+    if existing ~= nil and author ~= '' then
+        box.space.configs_history:update(
+            {existing.plugin, existing.filename, existing.version},
+            {{'=', 7, author}}
+        )
+    end
+    box.commit()
+    return result
 end
 
 function loom.file_delete(plugin, filename)
-    return box.space.configs_files:delete{plugin, filename}
+    box.begin()
+    local existing = box.space.configs_files:get{plugin, filename}
+    if existing ~= nil then
+        box.space.configs_history:replace{
+            existing.plugin, existing.filename, existing.version,
+            existing.raw, existing.mtime, existing.size, ''
+        }
+    end
+    local result = box.space.configs_files:delete{plugin, filename}
+    box.commit()
+    return result
+end
+
+function loom.file_history(plugin, filename, limit)
+    limit = limit or 50
+    local result = {}
+    -- Newest first via reverse iterator on the secondary index.
+    for _, t in box.space.configs_history.index.by_plugin_file:pairs(
+        {plugin, filename}, {iterator = box.index.LE}
+    ) do
+        if t.plugin ~= plugin or t.filename ~= filename then break end
+        table.insert(result, t)
+        if #result >= limit then break end
+    end
+    return result
+end
+
+function loom.file_get_version(plugin, filename, version)
+    local current = box.space.configs_files:get{plugin, filename}
+    if current ~= nil and current.version == version then
+        return current
+    end
+    return box.space.configs_history:get{plugin, filename, version}
+end
+
+function loom.file_revert(plugin, filename, version, author)
+    local target = loom.file_get_version(plugin, filename, version)
+    if target == nil then
+        error('version not found: ' .. plugin .. '/' .. filename .. '@' .. version)
+    end
+    return loom.file_upsert(plugin, filename, target.raw, author or ('revert@' .. version))
 end
 
 function loom.file_list(plugin)
