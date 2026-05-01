@@ -256,13 +256,13 @@ async fn authenticate(
     Ok(())
 }
 
-fn map_get<'a>(map: &'a Value, key: u8) -> Option<&'a Value> {
+fn map_get(map: &Value, key: u8) -> Option<&Value> {
     if let Value::Map(entries) = map {
         for (k, v) in entries {
-            if let Some(kn) = k.as_u64() {
-                if kn == key as u64 {
-                    return Some(v);
-                }
+            if let Some(kn) = k.as_u64()
+                && kn == key as u64
+            {
+                return Some(v);
             }
         }
     }
@@ -324,13 +324,13 @@ impl LoomApi {
                 Value::Array(vec![Value::from(plugin), Value::from(filename)]),
             )
             .await?;
-        if let Value::Array(arr) = r {
-            if let Some(tuple) = arr.into_iter().next() {
-                if matches!(tuple, Value::Nil) {
-                    return Ok(None);
-                }
-                return Ok(parse_file_tuple_full(&tuple));
+        if let Value::Array(arr) = r
+            && let Some(tuple) = arr.into_iter().next()
+        {
+            if matches!(tuple, Value::Nil) {
+                return Ok(None);
             }
+            return Ok(parse_file_tuple_full(&tuple));
         }
         Ok(None)
     }
@@ -376,41 +376,41 @@ fn unwrap_call_result(v: Value) -> Vec<Value> {
 }
 
 fn parse_file_tuple(t: &Value) -> Option<FileMeta> {
-    if let Value::Array(fields) = t {
-        if fields.len() >= 5 {
-            return Some(FileMeta {
-                plugin: fields[0].as_str()?.to_string(),
-                filename: fields[1].as_str()?.to_string(),
-                mtime: fields[3].as_u64().unwrap_or(0),
-                size: fields[4].as_u64().unwrap_or(0),
-            });
-        }
+    if let Value::Array(fields) = t
+        && fields.len() >= 5
+    {
+        return Some(FileMeta {
+            plugin: fields[0].as_str()?.to_string(),
+            filename: fields[1].as_str()?.to_string(),
+            mtime: fields[3].as_u64().unwrap_or(0),
+            size: fields[4].as_u64().unwrap_or(0),
+        });
     }
     None
 }
 
 fn parse_file_tuple_full(t: &Value) -> Option<FileEntry> {
-    if let Value::Array(fields) = t {
-        if fields.len() >= 5 {
-            let plugin = fields[0].as_str()?.to_string();
-            let filename = fields[1].as_str()?.to_string();
-            let raw = match &fields[2] {
-                Value::String(s) => s.as_bytes().to_vec(),
-                Value::Binary(b) => b.clone(),
-                _ => return None,
-            };
-            let mtime = fields[3].as_u64().unwrap_or(0);
-            let size = fields[4].as_u64().unwrap_or(raw.len() as u64);
-            return Some(FileEntry {
-                meta: FileMeta {
-                    plugin,
-                    filename,
-                    mtime,
-                    size,
-                },
-                raw,
-            });
-        }
+    if let Value::Array(fields) = t
+        && fields.len() >= 5
+    {
+        let plugin = fields[0].as_str()?.to_string();
+        let filename = fields[1].as_str()?.to_string();
+        let raw = match &fields[2] {
+            Value::String(s) => s.as_bytes().to_vec(),
+            Value::Binary(b) => b.clone(),
+            _ => return None,
+        };
+        let mtime = fields[3].as_u64().unwrap_or(0);
+        let size = fields[4].as_u64().unwrap_or(raw.len() as u64);
+        return Some(FileEntry {
+            meta: FileMeta {
+                plugin,
+                filename,
+                mtime,
+                size,
+            },
+            raw,
+        });
     }
     None
 }

@@ -205,10 +205,7 @@ impl Inner {
     }
 
     fn persist_fh(&mut self, fh: u64) -> Result<()> {
-        let need = match self.open_files.get(&fh) {
-            Some(b) if b.dirty => true,
-            _ => false,
-        };
+        let need = matches!(self.open_files.get(&fh), Some(b) if b.dirty);
         if !need {
             return Ok(());
         }
@@ -289,7 +286,7 @@ fn file_attr(ino: u64, size: u64, mtime_secs: u64) -> FileAttr {
     FileAttr {
         ino: INodeNo(ino),
         size,
-        blocks: (size + 511) / 512,
+        blocks: size.div_ceil(512),
         atime: mtime,
         mtime,
         ctime: mtime,
@@ -512,7 +509,12 @@ impl Filesystem for LoomFS {
                 is_dir: false,
             }) => {
                 if let Some(new_size) = size {
-                    if let Ok(f) = fs::OpenOptions::new().write(true).create(true).open(&real) {
+                    if let Ok(f) = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&real)
+                    {
                         let _ = f.set_len(new_size);
                     }
                     for buf in s.open_files.values_mut() {
@@ -1216,23 +1218,23 @@ impl Filesystem for LoomFS {
             _ => None,
         };
 
-        if let (Some(from), Some(to)) = (from_pass, to_pass) {
-            if from.exists() {
-                if let Err(e) = fs::rename(&from, &to) {
-                    error!(error = %e, "pass rename");
-                    reply.error(fuser::Errno::from_i32(EIO));
-                    return;
-                }
-                let from_key = match &p1 {
-                    Some(Entry::Root) => format!("/{}", n1),
-                    _ => pass_fs_path(&from),
-                };
-                if let Some(ino) = s.paths.remove(&from_key) {
-                    s.inodes.remove(&ino);
-                }
-                reply.ok();
+        if let (Some(from), Some(to)) = (from_pass, to_pass)
+            && from.exists()
+        {
+            if let Err(e) = fs::rename(&from, &to) {
+                error!(error = %e, "pass rename");
+                reply.error(fuser::Errno::from_i32(EIO));
                 return;
             }
+            let from_key = match &p1 {
+                Some(Entry::Root) => format!("/{}", n1),
+                _ => pass_fs_path(&from),
+            };
+            if let Some(ino) = s.paths.remove(&from_key) {
+                s.inodes.remove(&ino);
+            }
+            reply.ok();
+            return;
         }
 
         if let (
